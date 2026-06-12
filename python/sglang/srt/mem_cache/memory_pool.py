@@ -90,7 +90,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor], None]):
+    if t is None:
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -281,6 +283,10 @@ class MambaPool:
     class State:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
+        # Per-row (per-K-block) fp32 scale pool for fp8 (E4M3) temporal state;
+        # None for fp32/bf16/fp16 state (no scaling). Shape mirrors temporal but
+        # drops the last (K) dim: [..., HV, V].
+        temporal_scale: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -290,6 +296,8 @@ class MambaPool:
                 v = getattr(self, name)
                 if name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
+                elif v is None:
+                    kwargs[name] = None  # temporal_scale on non-fp8 state
                 else:
                     kwargs[name] = v[layer]
 
@@ -371,6 +379,16 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+            # fp8 (E4M3) temporal state carries a companion per-row fp32 scale
+            # pool: one scale per K-block (= the last dim of the state), so the
+            # scale shape drops the trailing K dim. None for fp32/bf16/fp16.
+            temporal_scale = None
+            if ssm_dtype == torch.float8_e4m3fn:
+                temporal_scale = torch.zeros(
+                    size=(num_mamba_layers, size + 1) + temporal_state_shape[:-1],
+                    dtype=torch.float32,
+                    device=device,
+                )
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
@@ -412,6 +430,7 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
+                    temporal_scale=temporal_scale,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
                 )
@@ -424,7 +443,11 @@ class MambaPool:
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
             else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                self.mamba_cache = self.State(
+                    conv=conv_state,
+                    temporal=temporal_state,
+                    temporal_scale=temporal_scale,
+                )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
@@ -464,6 +487,10 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
             :, src_indices
         ]
+        if self.mamba_cache.temporal_scale is not None:
+            self.mamba_cache.temporal_scale[:, dst_indices] = (
+                self.mamba_cache.temporal_scale[:, src_indices]
+            )
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -474,17 +501,26 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
+        scale_cpu = (
+            self.mamba_cache.temporal_scale[:, indices].to("cpu", non_blocking=True)
+            if self.mamba_cache.temporal_scale is not None
+            else None
+        )
         current_platform.synchronize()
-        return conv_cpu, temporal_cpu
+        return conv_cpu, temporal_cpu, scale_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        conv_cpu, temporal_cpu = mamba_cache_cpu
+        conv_cpu, temporal_cpu, scale_cpu = mamba_cache_cpu
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
+        if scale_cpu is not None and self.mamba_cache.temporal_scale is not None:
+            self.mamba_cache.temporal_scale[:, indices] = scale_cpu.to(
+                self.mamba_cache.temporal_scale.device, non_blocking=True
+            )
         current_platform.synchronize()
 
     def get_contiguous_buf_infos(self):

@@ -64,6 +64,9 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
+        # fp8 (E4M3) SSM state — FlashInfer GDN decode only; needs a companion
+        # per-row scale pool (MambaPool.temporal_scale).
+        "float8": torch.float8_e4m3fn,
     }
     conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
 

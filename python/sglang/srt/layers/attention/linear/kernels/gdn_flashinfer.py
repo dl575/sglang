@@ -190,6 +190,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
 
+        # fp8 (E4M3) state: the companion per-row scale pool, threaded via
+        # kwargs from the GDN backend (None for fp32/bf16/fp16). The FlashInfer
+        # kernel indexes it by the same cache_indices as the state pool.
+        ssm_state_scale = kwargs.get("ssm_state_scale")
+
         if self.use_state_pool:
             output_fi, _ = self._decode_fn(
                 q=query_fi,
@@ -204,6 +209,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 initial_state=ssm_states,
                 initial_state_indices=cache_indices,
                 use_sr=self.use_sr,
+                state_scale=ssm_state_scale,
             )
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
