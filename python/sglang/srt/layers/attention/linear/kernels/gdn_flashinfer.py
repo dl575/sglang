@@ -106,6 +106,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
 
+        # Stochastic rounding for the narrow (bf16/fp16) state store. Validated
+        # at startup (server_args) to require SM100+; gated here too so the
+        # kernel only sees use_sr=True on Blackwell.
+        from sglang.srt.environ import envs
+
+        self.use_sr = (
+            envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get() and sm_major >= 10
+        )
+        if self.use_sr:
+            logger.info(
+                "FlashInfer GDN decode: SSM stochastic rounding ENABLED "
+                "(hardware cvt.rs, Philox in CuTe DSL)."
+            )
+
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
         if self._mtp_fn is None:
@@ -189,6 +203,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm=True,
                 initial_state=ssm_states,
                 initial_state_indices=cache_indices,
+                use_sr=self.use_sr,
             )
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
@@ -206,6 +221,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=None,
                 output=None,
                 use_qk_l2norm=True,
+                use_sr=self.use_sr,
             )
             ssm_states[cache_indices] = new_state
 

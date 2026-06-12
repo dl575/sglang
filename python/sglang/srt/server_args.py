@@ -688,6 +688,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
+    mamba_ssm_enable_stochastic_rounding: bool = False
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -3399,6 +3400,32 @@ class ServerArgs:
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
+        # SSM stochastic rounding (FlashInfer GDN decode) requires the
+        # FlashInfer decode backend, a narrow state dtype, and SM100+ (the
+        # hardware cvt.rs instruction is Blackwell-only).
+        if self.mamba_ssm_enable_stochastic_rounding:
+            if decode != "flashinfer":
+                raise ValueError(
+                    "--mamba-ssm-enable-stochastic-rounding requires the "
+                    "FlashInfer GDN decode backend "
+                    "(--linear-attn-decode-backend flashinfer), "
+                    f"got {decode!r}"
+                )
+            if self.mamba_ssm_dtype not in ("bfloat16", "float16"):
+                raise ValueError(
+                    "--mamba-ssm-enable-stochastic-rounding requires "
+                    "--mamba-ssm-dtype bfloat16 or float16, "
+                    f"got {self.mamba_ssm_dtype!r}"
+                )
+            if (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] < 10
+            ):
+                raise ValueError(
+                    "--mamba-ssm-enable-stochastic-rounding requires SM100+ "
+                    "(Blackwell, hardware cvt.rs)."
+                )
+
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
         # for correctness and best performance.
         prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
@@ -4350,6 +4377,9 @@ class ServerArgs:
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.set(
+            "1" if self.mamba_ssm_enable_stochastic_rounding else "0"
+        )
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
@@ -6438,6 +6468,14 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
             help="The data type of the SSM states in mamba cache. "
             "If not set, will be read from model config (mamba_ssm_dtype).",
+        )
+        parser.add_argument(
+            "--mamba-ssm-enable-stochastic-rounding",
+            action="store_true",
+            help="Use stochastic rounding (instead of round-to-nearest) when "
+            "quantizing the SSM recurrent state to a narrow dtype (bfloat16/"
+            "float16). Unbiased in expectation. Requires the FlashInfer GDN "
+            "decode backend on SM100+ (Blackwell, hardware cvt.rs).",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
