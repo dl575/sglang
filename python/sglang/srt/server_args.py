@@ -3371,30 +3371,31 @@ class ServerArgs:
 
         # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
         # when the user hasn't explicitly chosen a decode backend and
-        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
+        # mamba-ssm-dtype is bf16 or fp16 (required by FlashInfer GDN on SM100+).
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
         if (
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
-            and self.mamba_ssm_dtype == "bfloat16"
+            and self.mamba_ssm_dtype in ("bfloat16", "float16")
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
-                "SM100+ detected with mamba-ssm-dtype=bfloat16, "
-                "defaulting --linear-attn-decode-backend to flashinfer."
+                "SM100+ detected with mamba-ssm-dtype=%s, "
+                "defaulting --linear-attn-decode-backend to flashinfer.",
+                self.mamba_ssm_dtype,
             )
 
-        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        # SM100+ FlashInfer GDN decode requires bf16 or fp16 state.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"
-            and self.mamba_ssm_dtype != "bfloat16"
+            and self.mamba_ssm_dtype not in ("bfloat16", "float16")
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
-                "--mamba-ssm-dtype bfloat16, "
+                "--mamba-ssm-dtype bfloat16 or float16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
