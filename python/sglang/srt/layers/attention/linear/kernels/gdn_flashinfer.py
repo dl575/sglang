@@ -2,7 +2,7 @@
 
 Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 
-SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
+SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32/bf16/fp16.
 SM100 (Blackwell): full support — decode, prefill, MTP.
 
 Requires flashinfer >= 0.6.7.
