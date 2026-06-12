@@ -3377,7 +3377,7 @@ class ServerArgs:
         if (
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
-            and self.mamba_ssm_dtype in ("bfloat16", "float16")
+            and self.mamba_ssm_dtype in ("bfloat16", "float16", "float8")
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -3390,13 +3390,13 @@ class ServerArgs:
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"
-            and self.mamba_ssm_dtype not in ("bfloat16", "float16")
+            and self.mamba_ssm_dtype not in ("bfloat16", "float16", "float8")
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability()[0] >= 10
         ):
             raise ValueError(
                 "--linear-attn-decode-backend flashinfer on SM100+ requires "
-                "--mamba-ssm-dtype bfloat16 or float16, "
+                "--mamba-ssm-dtype bfloat16, float16, or float8, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
@@ -3411,10 +3411,10 @@ class ServerArgs:
                     "(--linear-attn-decode-backend flashinfer), "
                     f"got {decode!r}"
                 )
-            if self.mamba_ssm_dtype not in ("bfloat16", "float16"):
+            if self.mamba_ssm_dtype not in ("bfloat16", "float16", "float8"):
                 raise ValueError(
                     "--mamba-ssm-enable-stochastic-rounding requires "
-                    "--mamba-ssm-dtype bfloat16 or float16, "
+                    "--mamba-ssm-dtype bfloat16, float16, or float8, "
                     f"got {self.mamba_ssm_dtype!r}"
                 )
             if (
@@ -6465,9 +6465,11 @@ class ServerArgs:
             "--mamba-ssm-dtype",
             type=str,
             default=None,
-            choices=["float32", "bfloat16", "float16"],
-            help="The data type of the SSM states in mamba cache. "
-            "If not set, will be read from model config (mamba_ssm_dtype).",
+            choices=["float32", "bfloat16", "float16", "float8"],
+            help="The data type of the SSM states in mamba cache. float8 (E4M3) "
+            "is FlashInfer GDN decode only (SM100+) and stores a companion "
+            "per-row scale pool. If not set, read from model config "
+            "(mamba_ssm_dtype).",
         )
         parser.add_argument(
             "--mamba-ssm-enable-stochastic-rounding",

@@ -365,6 +365,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            # fp8 state carries a companion per-row scale pool (None otherwise);
+            # forwarded via kwargs to the FlashInfer GDN decode backend.
+            ssm_state_scale=layer_cache.temporal_scale,
         )
 
         self._track_mamba_state_decode(
