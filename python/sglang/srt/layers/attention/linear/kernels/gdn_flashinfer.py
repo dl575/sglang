@@ -114,10 +114,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self.use_sr = (
             envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get() and sm_major >= 10
         )
+        self.philox_rounds = envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get()
         if self.use_sr:
             logger.info(
                 "FlashInfer GDN decode: SSM stochastic rounding ENABLED "
-                "(hardware cvt.rs, Philox in CuTe DSL)."
+                "(hardware cvt.rs, Philox in CuTe DSL, rounds=%d).",
+                self.philox_rounds,
             )
 
         if sm_major == 9 and self._prefill_fn is None:
@@ -209,6 +211,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 initial_state=ssm_states,
                 initial_state_indices=cache_indices,
                 use_sr=self.use_sr,
+                philox_rounds=self.philox_rounds,
                 state_scale=ssm_state_scale,
             )
         else:

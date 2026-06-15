@@ -689,6 +689,7 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
     mamba_ssm_enable_stochastic_rounding: bool = False
+    mamba_ssm_philox_rounds: int = 10
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -3425,6 +3426,11 @@ class ServerArgs:
                     "--mamba-ssm-enable-stochastic-rounding requires SM100+ "
                     "(Blackwell, hardware cvt.rs)."
                 )
+            if self.mamba_ssm_philox_rounds < 1:
+                raise ValueError(
+                    "--mamba-ssm-philox-rounds must be >= 1, "
+                    f"got {self.mamba_ssm_philox_rounds}"
+                )
 
         # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
         # for correctness and best performance.
@@ -4380,6 +4386,7 @@ class ServerArgs:
         envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.set(
             "1" if self.mamba_ssm_enable_stochastic_rounding else "0"
         )
+        envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.set(str(self.mamba_ssm_philox_rounds))
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
@@ -6478,6 +6485,17 @@ class ServerArgs:
             "quantizing the SSM recurrent state to a narrow dtype (bfloat16/"
             "float16). Unbiased in expectation. Requires the FlashInfer GDN "
             "decode backend on SM100+ (Blackwell, hardware cvt.rs).",
+        )
+        parser.add_argument(
+            "--mamba-ssm-philox-rounds",
+            type=int,
+            default=ServerArgs.mamba_ssm_philox_rounds,
+            help="Number of Philox-4x32 rounds for SSM stochastic rounding "
+            "(only used with --mamba-ssm-enable-stochastic-rounding). The "
+            "default of 10 matches the RNG quality of the reference; fewer "
+            "rounds are cheaper but lower the RNG quality, and the safe "
+            "minimum is model-dependent. Compile-time per the FlashInfer "
+            "kernel, so each value JIT-compiles its own cubin.",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
