@@ -6492,10 +6492,10 @@ class ServerArgs:
             default=ServerArgs.mamba_ssm_philox_rounds,
             help="Number of Philox-4x32 rounds for SSM stochastic rounding "
             "(only used with --mamba-ssm-enable-stochastic-rounding). The "
-            "default of 10 matches the RNG quality of the reference; values "
-            "below ~5 degrade the rounding distribution (especially for fp8). "
-            "Compile-time per the FlashInfer kernel, so each value JIT-compiles "
-            "its own cubin.",
+            "default of 10 matches the RNG quality of the reference; fewer "
+            "rounds are cheaper but lower the RNG quality, and the safe "
+            "minimum is model-dependent. Compile-time per the FlashInfer "
+            "kernel, so each value JIT-compiles its own cubin.",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
