@@ -34,9 +34,10 @@ def _quantize_fp8_per_row(x: torch.Tensor):
     here — the track path fires only at prefix-cache boundaries; the per-step
     decode and the post-accept commit carry the stochastic rounding.
     """
-    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    xf = x.float()  # h is bf16/fp16; compute in fp32 so the scale matches the
+    amax = xf.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # fp32 temporal_scale pool
     scale = amax / 448.0
-    q = (x / scale).to(torch.float8_e4m3fn)
+    q = (xf / scale).to(torch.float8_e4m3fn)
     return q, scale.squeeze(-1)
 
 
