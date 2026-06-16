@@ -112,6 +112,102 @@ def track_mamba_states_if_needed(
     )
 
 
+# ---------------------------------------------------------------------------
+# fp8 (E4M3) quantizing scatter for the GDN MTP commit (Phase B / S-4).
+#
+# When the destination SSM cache is fp8, the accepted FP32 intermediate snapshot
+# is quantized to E4M3 with a per-(HV,V) row scale (amax / 448, block = K) and,
+# optionally, stochastic rounding via the hardware ``cvt.rs.satfinite.e4m3x4``
+# instruction. The companion fp32 scale pool is written in lockstep so the next
+# load-dequant (fp8 * scale) is correct. Matches the decode fp8 store convention.
+# ---------------------------------------------------------------------------
+_E4M3_MAX = tl.constexpr(448.0)  # Triton @jit can only read constexpr globals
+
+
+@triton.jit
+def _cvt_rs_e4m3x4(x, rand):
+    """fp32 -> e4m3 stochastic rounding (hardware cvt.rs, pack=4, SM100+)."""
+    return tl.inline_asm_elementwise(
+        asm="{ cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5; }",
+        constraints="=r,r,r,r,r,r,r,r,r",
+        args=(x, rand),
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
+def _scatter_quant_fp8_kernel(
+    src_ptr,  # fp32 [layers, spec, draft, HV, V, K] (contiguous)
+    dst_ptr,  # e4m3 [layers, cache, HV, V, K]
+    scale_ptr,  # fp32 [layers, cache, HV, V]
+    dst_indices_raw_ptr,
+    step_indices_raw_ptr,
+    seed_ptr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    scale_layer_stride,
+    scale_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    USE_SR: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    K: tl.constexpr,
+):
+    """One program per (request, layer, (HV,V)-row); each block is one K-row.
+
+    Quantizes the accepted FP32 snapshot row to E4M3 with a per-row scale and
+    writes both the fp8 state and the fp32 scale. Grid: (requests, layers, HV*V).
+    """
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_row = tl.program_id(2).to(tl.int64)
+
+    step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    if step_idx < 0:
+        return
+    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+    src_idx = pid_req
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (src_idx < src_req_size)
+        & (step_idx < src_step_size)
+    ):
+        return
+
+    k = tl.arange(0, K)
+    src_off = (
+        pid_layer * src_layer_stride
+        + src_idx * src_req_stride
+        + step_idx * src_step_stride
+        + pid_row * K
+    )
+    dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + pid_row * K
+
+    row = tl.load(src_ptr + src_off + k)  # fp32 [K]
+    amax = tl.max(tl.abs(row))
+    scale = tl.maximum(amax / _E4M3_MAX, 1e-8)
+    y = row / scale  # in [-448, 448]
+    if USE_SR:
+        # Per-element Philox offset = within-entry flat index; the per-call seed
+        # varies the randomness across commits (matches the decode store).
+        rand = tl.randint(
+            tl.load(seed_ptr), (pid_row * K + k).to(tl.int32), PHILOX_ROUNDS
+        )
+        q = _cvt_rs_e4m3x4(y, rand)
+    else:
+        q = y.to(tl.float8e4nv)  # round-to-nearest
+    tl.store(dst_ptr + dst_off + k, q)
+    scale_off = pid_layer * scale_layer_stride + dst_idx * scale_req_stride + pid_row
+    tl.store(scale_ptr + scale_off, scale)
+
+
 @triton.jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
@@ -191,6 +287,9 @@ def fused_mamba_state_scatter_with_mask(
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
     dst_indices_raw: torch.Tensor,  # [total_requests] - raw indices (e.g., state_indices_tensor)
     step_indices_raw: torch.Tensor,  # [total_requests] - raw step indices (step >= 0 means valid)
+    dst_scale: torch.Tensor = None,  # fp32 [num_layers, cache_size, HV, V] when dst is fp8
+    use_sr: bool = False,  # stochastic rounding for the fp8 quantization
+    philox_rounds: int = 10,
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
@@ -263,6 +362,47 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError("dst tensor must be contiguous")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
+
+    # fp8 destination (GDN MTP commit): quantize the accepted FP32 snapshot to
+    # E4M3 with a per-(HV,V) row scale (block = K), optionally with hardware SR,
+    # and write the companion fp32 scale pool in lockstep. Keyed on dst.dtype so
+    # both SSM scatter calls (commit + prefix-cache track) pick it up; the conv
+    # scatters (bf16 dst) fall through to the plain copy below.
+    if dst.dtype == torch.float8_e4m3fn:
+        if dst_scale is None:
+            raise ValueError("fp8 scatter requires dst_scale (the temporal_scale pool)")
+        if src.dtype != torch.float32:
+            raise ValueError(f"fp8 scatter expects fp32 src, got {src.dtype}")
+        if not dst_scale.is_contiguous():
+            raise ValueError("dst_scale must be contiguous")
+        K = dst.shape[-1]
+        if elem_per_entry % K != 0:
+            raise ValueError(f"elem_per_entry {elem_per_entry} not divisible by K {K}")
+        num_rows = elem_per_entry // K  # HV * V
+        seed = torch.randint(0, 2**31 - 1, (1,), device=dst.device, dtype=torch.int32)
+        grid_fp8 = (total_requests, num_layers, num_rows)
+        _scatter_quant_fp8_kernel[grid_fp8](
+            src,
+            dst,
+            dst_scale,
+            dst_indices_raw,
+            step_indices_raw,
+            seed,
+            src_layer_stride,
+            src_req_stride,
+            src_step_stride,
+            dst_layer_stride,
+            dst_req_stride,
+            dst_scale.stride(0),
+            dst_scale.stride(1),
+            src_req_size,
+            src_step_size,
+            dst_req_size,
+            USE_SR=use_sr,
+            PHILOX_ROUNDS=philox_rounds,
+            K=K,
+        )
+        return
 
     # Block size for copying elements
     BLOCK_SIZE = 1024

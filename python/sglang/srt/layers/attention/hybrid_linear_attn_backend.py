@@ -894,6 +894,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
+        # fp8 SSM commit: the FP32 intermediate snapshot is quantized to E4M3 +
+        # per-row scale at the scatter (scale is None for bf16/fp16, which copy
+        # as-is). SR config mirrors the decode/verify path. Applies to both SSM
+        # scatters below (commit + prefix-cache track); the conv scatters are
+        # bf16 and copy unchanged.
+        from sglang.srt.environ import envs
+
+        ssm_state_scale = mamba_caches.temporal_scale
+        ssm_use_sr = envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get()
+        ssm_philox_rounds = envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get()
+
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
         fused_mamba_state_scatter_with_mask(
@@ -901,6 +912,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_state_cache,
             state_indices_tensor,
             last_correct_step_indices,
+            dst_scale=ssm_state_scale,
+            use_sr=ssm_use_sr,
+            philox_rounds=ssm_philox_rounds,
         )
         fused_mamba_state_scatter_with_mask(
             conv_states,
@@ -918,6 +932,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 intermediate_state_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+                dst_scale=ssm_state_scale,
+                use_sr=ssm_use_sr,
+                philox_rounds=ssm_philox_rounds,
             )
             fused_mamba_state_scatter_with_mask(
                 conv_states,
