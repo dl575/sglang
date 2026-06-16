@@ -399,6 +399,15 @@ class MambaPool:
                     )
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                # fp8 SSM state keeps the MTP intermediate snapshot in FP32
+                # (lossless); the fp32->E4M3 SR quantization happens at the
+                # post-accept commit. bf16/fp16 state stores the snapshot in its
+                # own dtype (SR applied inside the verify kernel).
+                intermediate_ssm_dtype = (
+                    torch.float32
+                    if ssm_dtype == torch.float8_e4m3fn
+                    else ssm_dtype
+                )
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
@@ -408,7 +417,7 @@ class MambaPool:
                         temporal_state_shape[1],
                         temporal_state_shape[2],
                     ),
-                    dtype=ssm_dtype,
+                    dtype=intermediate_ssm_dtype,
                     device="cuda",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify

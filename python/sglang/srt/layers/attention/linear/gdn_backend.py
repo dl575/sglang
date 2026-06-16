@@ -490,6 +490,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
+                # fp8: scale pool for the verify kernel's load-dequant (None for
+                # bf16/fp16). Mirrors the decode path's ssm_state_scale.
+                ssm_state_scale=mamba_cache_params.temporal_scale,
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)

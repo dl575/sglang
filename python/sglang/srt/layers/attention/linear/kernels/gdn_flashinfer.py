@@ -380,6 +380,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # pool-scoped and may include an extra dummy slot.
             intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]
 
+        # fp8 state: scale pool drives the verify kernel's load-dequant. SR config
+        # is forwarded too — for bf16/fp16 SR lands on the fp32->narrow snapshot
+        # write in-kernel; for fp8 the snapshot is FP32 and SR happens at the
+        # post-accept commit (so use_sr is a no-op on the fp8 snapshot write).
+        ssm_state_scale = kwargs.get("ssm_state_scale")
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
             k=key_mtp,
@@ -395,6 +400,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             intermediate_states_buffer=intermediate_states_buffer_mtp,
             disable_state_update=True,
             use_qk_l2norm=True,
+            use_sr=self.use_sr,
+            philox_rounds=self.philox_rounds,
+            state_scale=ssm_state_scale,
         )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
