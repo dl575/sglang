@@ -339,7 +339,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_v_dim=layer.head_v_dim,
             )
             self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
+                forward_batch,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                ssm_state_scale=layer_cache.temporal_scale,
             )
             return core_attn_out
 
@@ -371,7 +375,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
+            forward_batch,
+            conv_states,
+            ssm_states,
+            cache_indices,
+            ssm_state_scale=layer_cache.temporal_scale,
         )
 
         return core_attn_out
@@ -515,7 +523,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             if h is not None:
                 self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
+                    forward_batch,
+                    h,
+                    ssm_states,
+                    forward_metadata,
+                    ssm_state_scale=mamba_cache_params.temporal_scale,
                 )
 
         return core_attn_out

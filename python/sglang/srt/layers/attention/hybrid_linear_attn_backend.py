@@ -25,6 +25,21 @@ from sglang.srt.speculative.spec_info import SpecInput
 logger = logging.getLogger(__name__)
 
 
+def _quantize_fp8_per_row(x: torch.Tensor):
+    """Per-(.,K) row fp8 (E4M3) quantization, RTN: ``x[..., K] -> (e4m3, scale[...])``.
+
+    Matches the decode/commit convention (scale = amax / 448, block = K). Used by
+    the prefix-cache *track* paths, where a persistent fp8 SSM slot is (re)written
+    by a torch-level copy and must carry its companion per-row scale. RTN (no SR)
+    here — the track path fires only at prefix-cache boundaries; the per-step
+    decode and the post-accept commit carry the stochastic rounding.
+    """
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scale = amax / 448.0
+    q = (x / scale).to(torch.float8_e4m3fn)
+    return q, scale.squeeze(-1)
+
+
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -497,6 +512,7 @@ class MambaAttnBackendBase(AttentionBackend):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        ssm_state_scale: Optional[torch.Tensor] = None,
     ):
         """
         Track and copy Mamba conv/SSM states during decode for prefix caching.
@@ -520,6 +536,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_indices,
                 forward_batch.batch_size,
             )
+            # fp8: the persistent ssm copy above moves bytes only; the companion
+            # per-row scale must move with it or the destination dequants against
+            # a stale scale. (Per-layer cache here: index dim 0 = pool slot.)
+            if ssm_state_scale is not None:
+                m = forward_batch.mamba_track_mask
+                ssm_state_scale[forward_batch.mamba_track_indices[m]] = (
+                    ssm_state_scale[cache_indices[m]]
+                )
 
     def _track_mamba_state_extend(
         self,
@@ -527,6 +551,7 @@ class MambaAttnBackendBase(AttentionBackend):
         h: torch.Tensor,
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
+        ssm_state_scale: Optional[torch.Tensor] = None,
     ):
         """
         Track and copy SSM states during extend for prefix caching.
@@ -544,13 +569,23 @@ class MambaAttnBackendBase(AttentionBackend):
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+                src_h = h[forward_metadata.track_ssm_h_src]
+                dst = forward_metadata.track_ssm_h_dst
+                if ssm_state_scale is not None:
+                    # fp8: quantize the fp32 recurrent state to E4M3 + per-row
+                    # scale (a plain .to(fp8) would drop the scale -> garbage).
+                    q, sc = _quantize_fp8_per_row(src_h)
+                    ssm_states[dst] = q
+                    ssm_state_scale[dst] = sc
+                else:
+                    ssm_states[dst] = src_h.to(ssm_states.dtype, copy=False)
             if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
+                fsrc = forward_metadata.track_ssm_final_src
+                fdst = forward_metadata.track_ssm_final_dst
+                ssm_states[fdst] = ssm_states[fsrc]
+                # fp8: carry the companion per-row scale with the copied state.
+                if ssm_state_scale is not None:
+                    ssm_state_scale[fdst] = ssm_state_scale[fsrc]
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
