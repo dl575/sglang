@@ -513,6 +513,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                ssm_state_scale=mamba_cache_params.temporal_scale,
             )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:

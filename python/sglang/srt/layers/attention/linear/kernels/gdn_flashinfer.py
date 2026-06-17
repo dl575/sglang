@@ -249,6 +249,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        ssm_state_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple:
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
@@ -265,16 +266,31 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
+        is_fp8_state = ssm_states.dtype == torch.float8_e4m3fn
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            # Pre-allocate bf16 output_state so the kernel compiles and writes the
-            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
-            # fp32->bf16 conversion in the scatter step.
-            output_state_fi = torch.empty_like(initial_state_fi)
+            if is_fp8_state:
+                # fp8 cache: dequantize to float32 for the prefill kernel.
+                # chunk_gated_delta_rule requires float32 initial_state; passing
+                # raw fp8 bytes would silently misread every element as float32.
+                # Per design: fp8 quantization is decode-only (cache size); prefill
+                # always runs in bf16/fp32 and commits once at the end.
+                raw = ssm_states[ssm_cache_indices].contiguous()  # fp8
+                scale = ssm_state_scale[ssm_cache_indices] if ssm_state_scale is not None else None
+                if scale is not None:
+                    # dequant: fp8 * per-row scale → float32
+                    initial_state_fi = raw.float() * scale.unsqueeze(-1)
+                else:
+                    initial_state_fi = raw.float()
+            else:
+                initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            # chunk_gated_delta_rule writes output_state as float32
+            output_state_fi = torch.empty(
+                initial_state_fi.shape, dtype=torch.float32, device=q.device
+            )
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,
@@ -282,7 +298,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 g=alpha_fi,
                 beta=beta_fi,
                 scale=None,
-                initial_state=initial_state_fi,
+                initial_state=initial_state_fi.float(),
                 output_final_state=True,
                 cu_seqlens=query_start_loc,  # already int32
                 use_qk_l2norm_in_kernel=False,
@@ -310,12 +326,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=False,
             )
 
-        # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        # Write back state to pool.
+        # fp8: quantize with per-row amax/448 scale (same path as decode commit).
+        # A raw .to(fp8) would saturate immediately with no scale, corrupting the
+        # state across chunked-prefill boundaries. bf16/fp16: direct cast is fine.
+        if self.use_state_pool and is_fp8_state:
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                _quantize_fp8_per_row,
+            )
+            q_state, sc = _quantize_fp8_per_row(output_state_fi)
+            ssm_states.index_copy_(0, ssm_cache_indices, q_state)
+            if ssm_state_scale is not None:
+                ssm_state_scale.index_copy_(0, ssm_cache_indices, sc)
+        else:
+            ssm_states.index_copy_(
+                0,
+                ssm_cache_indices,
+                output_state_fi.to(ssm_states.dtype),
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
