@@ -326,18 +326,27 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=False,
             )
 
-        # Write back state to pool.
-        # fp8: quantize with per-row amax/448 scale (same path as decode commit).
-        # A raw .to(fp8) would saturate immediately with no scale, corrupting the
-        # state across chunked-prefill boundaries. bf16/fp16: direct cast is fine.
-        if self.use_state_pool and is_fp8_state:
-            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-                _quantize_fp8_per_row,
+        # Write back state to pool with optional SR — consistent with the per-step
+        # decode commit. Uses scatter_extend_state for all state dtypes:
+        #   fp8:       per-row amax/448 scale + optional cvt.rs e4m3x4 SR
+        #   bf16/fp16: optional cvt.rs narrowx2 SR, else direct RTN cast
+        # SR is applied when self.use_sr is set (SM100+ only, validated at startup).
+        if self.use_state_pool:
+            from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+                scatter_extend_state,
             )
-            q_state, sc = _quantize_fp8_per_row(output_state_fi)
-            ssm_states.index_copy_(0, ssm_cache_indices, q_state)
-            if ssm_state_scale is not None:
-                ssm_state_scale.index_copy_(0, ssm_cache_indices, sc)
+            # output_state_fi is float32 [B, HV, V, K] (prefill kernel output)
+            B = ssm_cache_indices.shape[0]
+            _, HV, V, K = ssm_states.shape  # pool, HV, V, K
+            out = output_state_fi.reshape(B, HV, V, K)
+            scatter_extend_state(
+                src=out,
+                dst=ssm_states,
+                dst_scale=ssm_state_scale,
+                indices=ssm_cache_indices,
+                use_sr=self.use_sr,
+                philox_rounds=self.philox_rounds,
+            )
         else:
             ssm_states.index_copy_(
                 0,

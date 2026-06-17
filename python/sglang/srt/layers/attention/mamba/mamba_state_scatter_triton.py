@@ -138,6 +138,132 @@ def _cvt_rs_e4m3x4(x, rand):
 
 
 @triton.jit
+def _cvt_rs_narrowx2(x, rand, IS_BF16: tl.constexpr):
+    """fp32 -> bf16 or fp16 stochastic rounding (hardware cvt.rs, pack=2, SM100+)."""
+    if IS_BF16:
+        return tl.inline_asm_elementwise(
+            asm="{ cvt.rs.bf16x2.f32 $0, {$2, $1}, $3; }",
+            constraints="=r,r,r,r",
+            args=(x, rand),
+            dtype=tl.bfloat16,
+            is_pure=True,
+            pack=2,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            asm="{ cvt.rs.f16x2.f32 $0, {$2, $1}, $3; }",
+            constraints="=r,r,r,r",
+            args=(x, rand),
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
+
+
+@triton.jit
+def _scatter_extend_state_kernel(
+    src_ptr,    # fp32 [B, HV*V, K]
+    dst_ptr,    # bf16/fp16/fp8 [pool, HV*V, K]
+    scale_ptr,  # fp32 [pool, HV*V] — only used for fp8, else None
+    idx_ptr,    # int64 [B] — indices into dst pool
+    seed_ptr,   # int32 [1] — Philox seed
+    B, HV_V, K: tl.constexpr,
+    pool_HV_V_K_stride,   # dst stride for pool dim = HV*V*K
+    USE_SR: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    IS_BF16: tl.constexpr,  # IO dtype (ignored for fp8)
+):
+    """One program per (batch, HV*V row); scatter fp32 → narrow dtype with optional SR.
+
+    Grid: (B * HV_V,).  Each program handles one K-element row.
+    Dispatches to fp8 (per-row amax scale + cvt.rs e4m3x4) or bf16/fp16 (cvt.rs narrowx2).
+    """
+    pid = tl.program_id(0)
+    b = pid // HV_V
+    row = pid % HV_V  # flat (hv, v) index
+
+    dst_idx = tl.load(idx_ptr + b)
+
+    k = tl.arange(0, K)
+    src_off = b * HV_V * K + row * K + k
+    dst_off = dst_idx * pool_HV_V_K_stride + row * K + k
+    src = tl.load(src_ptr + src_off)  # fp32 [K]
+
+    if IS_FP8:
+        amax = tl.max(tl.abs(src))
+        scale = tl.maximum(amax / _E4M3_MAX, 1e-8)
+        y = src / scale
+        if USE_SR:
+            rand = tl.randint(
+                tl.load(seed_ptr), (pid * K + k).to(tl.int32), PHILOX_ROUNDS
+            )
+            q = _cvt_rs_e4m3x4(y, rand)
+        else:
+            q = y.to(tl.float8e4nv)
+        tl.store(dst_ptr + dst_off + k, q)
+        scale_off = dst_idx * HV_V + row
+        tl.store(scale_ptr + scale_off, scale)
+    else:
+        if USE_SR:
+            rand = tl.randint(
+                tl.load(seed_ptr), (pid * K + k).to(tl.int32), PHILOX_ROUNDS
+            )
+            q = _cvt_rs_narrowx2(src, rand, IS_BF16)
+        else:
+            if IS_BF16:
+                q = src.to(tl.bfloat16)
+            else:
+                q = src.to(tl.float16)
+        tl.store(dst_ptr + dst_off + k, q)
+
+
+def scatter_extend_state(
+    src: torch.Tensor,          # fp32 [B, HV, V, K]
+    dst: torch.Tensor,          # bf16/fp16/fp8 [pool, HV, V, K]
+    dst_scale: torch.Tensor,    # fp32 [pool, HV, V] or None
+    indices: torch.Tensor,      # int64 [B]
+    use_sr: bool = False,
+    philox_rounds: int = 10,
+):
+    """Scatter fp32 prefill output state to the narrow-dtype SSM pool with optional SR.
+
+    Replaces the plain `index_copy_(... .to(dtype))` in the extend writeback so that
+    SR (when enabled) is applied consistently at the prefill→decode boundary, matching
+    the per-step decode commit. Supports fp8 (per-row amax/448 scale), bf16, and fp16.
+    """
+    B, HV, V, K = src.shape
+    HV_V = HV * V
+    assert src.dtype == torch.float32
+    assert dst.shape == (dst.shape[0], HV, V, K)
+    assert indices.shape == (B,)
+    is_fp8 = dst.dtype == torch.float8_e4m3fn
+    is_bf16 = dst.dtype == torch.bfloat16
+    if is_fp8 and dst_scale is None:
+        raise ValueError("fp8 dst requires dst_scale")
+
+    # Flatten HV, V into one dim for the kernel
+    src_flat = src.reshape(B, HV_V, K).contiguous()
+    dst_flat = dst.reshape(dst.shape[0], HV_V, K)
+    scale_flat = dst_scale.reshape(dst_scale.shape[0], HV_V) if dst_scale is not None else None
+
+    seed = torch.randint(0, 2**31 - 1, (1,), device=src.device, dtype=torch.int32)
+    grid = (B * HV_V,)
+    _scatter_extend_state_kernel[grid](
+        src_flat, dst_flat,
+        scale_flat if scale_flat is not None else src_flat,  # dummy for non-fp8
+        indices,
+        seed,
+        B, HV_V, K,
+        dst_flat.stride(0),  # pool_HV_V_K_stride
+        USE_SR=use_sr,
+        PHILOX_ROUNDS=philox_rounds,
+        IS_FP8=is_fp8,
+        IS_BF16=is_bf16,
+    )
+
+
+@triton.jit
 def _scatter_quant_fp8_kernel(
     src_ptr,  # fp32 [layers, spec, draft, HV, V, K] (contiguous)
     dst_ptr,  # e4m3 [layers, cache, HV, V, K]
