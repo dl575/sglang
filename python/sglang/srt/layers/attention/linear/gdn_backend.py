@@ -546,13 +546,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
             if fp8_state:
-                # Quantize the updated bf16 buffer back to fp8 with per-row
+                # Quantize the triton-computed final state to fp8 with per-row
                 # scale and write to the real fp8 pool at the correct indices.
+                # NOTE: use `h` (the returned final state), NOT bf16_buf (the
+                # input buffer which chunk_gated_delta_rule does NOT update
+                # in-place — it returns the final state as the 3rd element).
                 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
                     scatter_extend_state,
                 )
+                B_h, HV_h, V_h, K_h = h.shape
                 scatter_extend_state(
-                    src=bf16_buf.float(),  # fp32 [B, HV, V, K]
+                    src=h.float().reshape(B_h, HV_h, V_h, K_h),
                     dst=ssm_states,
                     dst_scale=fp8_scale,
                     indices=cache_indices.to(torch.int64),
