@@ -504,17 +504,60 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+            # fp8 state: the triton extend kernel expects bf16/fp32 state and
+            # writes back bf16 in-place. With an fp8 pool we must give it a
+            # temporary bf16 staging buffer, then quantize the result to fp8
+            # (with per-row scale) before committing to the real fp8 pool.
+            fp8_state = ssm_states.dtype == torch.float8_e4m3fn
+            if fp8_state:
+                # The triton extend kernel expects bf16/fp32 state but the pool
+                # is fp8. Pass a batch-sized bf16 buffer (B slots only, not the
+                # full pool) seeded with the dequantized current state.
+                fp8_scale = mamba_cache_params.temporal_scale  # [pool, HV, V]
+                B_ext = cache_indices.shape[0]
+                _, HV_e, V_e, K_e = ssm_states.shape
+                slots = ssm_states[cache_indices]     # fp8 [B, HV, V, K]
+                scales = fp8_scale[cache_indices]     # fp32 [B, HV, V]
+                # dequant: fp8 * per-row scale → fp32 → bf16
+                bf16_buf = (slots.float() * scales.unsqueeze(-1)).to(
+                    torch.bfloat16
+                )  # [B, HV, V, K]
+                # triton needs initial_state_indices pointing into this buffer
+                buf_indices = torch.arange(
+                    B_ext, dtype=torch.int32, device=ssm_states.device
+                )
+                extend_states = bf16_buf
+                extend_indices = buf_indices
+            else:
+                extend_states = ssm_states
+                extend_indices = cache_indices
+
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                ssm_states=extend_states,
+                cache_indices=extend_indices,
                 query_start_loc=query_start_loc,
                 ssm_state_scale=mamba_cache_params.temporal_scale,
             )
+
+            if fp8_state:
+                # Quantize the updated bf16 buffer back to fp8 with per-row
+                # scale and write to the real fp8 pool at the correct indices.
+                from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+                    scatter_extend_state,
+                )
+                scatter_extend_state(
+                    src=bf16_buf.float(),  # fp32 [B, HV, V, K]
+                    dst=ssm_states,
+                    dst_scale=fp8_scale,
+                    indices=cache_indices.to(torch.int64),
+                    use_sr=False,
+                )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
