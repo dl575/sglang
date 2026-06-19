@@ -546,27 +546,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
             if fp8_state:
-                # Quantize the triton-computed final state to fp8 with per-row
-                # scale and write to the real fp8 pool at the correct indices.
-                # NOTE: use `h` (the returned final state), NOT bf16_buf (the
-                # input buffer which chunk_gated_delta_rule does NOT update
-                # in-place — it returns the final state as the 3rd element).
-                from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-                    scatter_extend_state,
+                # Quantize the triton-computed final state (bf16_buf, updated in-place
+                # by chunk_gated_delta_rule) to fp8 with per-row scale and scatter to
+                # the real fp8 pool. Use _quantize_fp8_per_row (Python/ATen, no Triton)
+                # to avoid the Triton fp8 vectorized-store interleaving bug that produces
+                # wrong bit patterns for every other K-element pair.
+                from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                    _quantize_fp8_per_row,
                 )
-                # Use bf16_buf (updated in-place by chunk_gated_delta_rule via pool
-                # scatter with buf_indices=[0..B_ext-1]) — same shape as cache_indices.
-                # bf16_buf shape [B_ext, HV, V, K], cache_indices shape [B_ext]: match.
-                # h (3rd return of chunk_gated_delta_rule) may have extra leading dims
-                # and a different B count in cu_seqlens packed-batch mode; avoid it.
-                _, HV_e, V_e, K_e = ssm_states.shape
-                scatter_extend_state(
-                    src=bf16_buf.float(),   # [B_ext, HV, V, K] — FLA updated in-place
-                    dst=ssm_states,
-                    dst_scale=fp8_scale,
-                    indices=cache_indices.to(torch.int64),  # [B_ext]
-                    use_sr=False,
-                )
+                q_state, q_scale = _quantize_fp8_per_row(bf16_buf)
+                ssm_states.index_copy_(0, cache_indices.to(torch.int64), q_state)
+                fp8_scale.index_copy_(0, cache_indices.to(torch.int64), q_scale)
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
