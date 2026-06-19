@@ -555,8 +555,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     _quantize_fp8_per_row,
                 )
                 q_state, q_scale = _quantize_fp8_per_row(bf16_buf)
-                ssm_states.index_copy_(0, cache_indices.to(torch.int64), q_state)
-                fp8_scale.index_copy_(0, cache_indices.to(torch.int64), q_scale)
+                # index_copy_ not supported for fp8; use advanced indexing
+                ssm_states[cache_indices.to(torch.int64)] = q_state
+                fp8_scale[cache_indices.to(torch.int64)] = q_scale
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
