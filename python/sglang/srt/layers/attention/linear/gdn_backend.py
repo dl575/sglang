@@ -554,19 +554,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
                     scatter_extend_state,
                 )
-                # h shape from FLA: [N_seqs, HV, V, K] or with extra leading dims
-                # in cu_seqlens / packed-batch mode. Flatten to [N_seqs, HV, V, K].
-                # N_seqs == B_ext (cache_indices.shape[0]) by construction.
+                # Use bf16_buf (updated in-place by chunk_gated_delta_rule via pool
+                # scatter with buf_indices=[0..B_ext-1]) — same shape as cache_indices.
+                # bf16_buf shape [B_ext, HV, V, K], cache_indices shape [B_ext]: match.
+                # h (3rd return of chunk_gated_delta_rule) may have extra leading dims
+                # and a different B count in cu_seqlens packed-batch mode; avoid it.
                 _, HV_e, V_e, K_e = ssm_states.shape
-                h_flat = h.contiguous().view(-1, HV_e, V_e, K_e)  # [N_seqs, HV, V, K]
-                N_h = h_flat.shape[0]
-                # cache_indices contains the pool slots for the N_h updated sequences
-                idx = cache_indices[:N_h].to(torch.int64)
                 scatter_extend_state(
-                    src=h_flat.float(),
+                    src=bf16_buf.float(),   # [B_ext, HV, V, K] — FLA updated in-place
                     dst=ssm_states,
                     dst_scale=fp8_scale,
-                    indices=idx,
+                    indices=cache_indices.to(torch.int64),  # [B_ext]
                     use_sr=False,
                 )
 
