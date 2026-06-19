@@ -558,7 +558,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # mode (extra leading batch dim). Flatten to [B_ext, HV, V, K] using
                 # cache_indices.shape[0] as the authoritative B.
                 _, HV_e, V_e, K_e = ssm_states.shape
-                h_flat = h.reshape(B_ext, HV_e, V_e, K_e)  # [B_ext, HV, V, K]
+                h_flat = h.contiguous().reshape(B_ext, HV_e, V_e, K_e)  # [B_ext, HV, V, K]
                 scatter_extend_state(
                     src=h_flat.float(),
                     dst=ssm_states,
