@@ -554,9 +554,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
                     scatter_extend_state,
                 )
-                B_h, HV_h, V_h, K_h = h.shape
+                # h shape from FLA: [B, HV, V, K] or [1, B, HV, V, K] in cu_seqlens mode
+                h_flat = h.reshape(-1, *ssm_states.shape[1:])  # [B, HV, V, K]
                 scatter_extend_state(
-                    src=h.float().reshape(B_h, HV_h, V_h, K_h),
+                    src=h_flat.float(),
                     dst=ssm_states,
                     dst_scale=fp8_scale,
                     indices=cache_indices.to(torch.int64),
