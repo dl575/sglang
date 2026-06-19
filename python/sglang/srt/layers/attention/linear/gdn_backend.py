@@ -554,16 +554,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
                     scatter_extend_state,
                 )
-                # h shape from FLA: [B, HV, V, K] or [1, B, HV, V, K] in cu_seqlens
-                # mode (extra leading batch dim). Flatten to [B_ext, HV, V, K] using
-                # cache_indices.shape[0] as the authoritative B.
+                # h shape from FLA: [N_seqs, HV, V, K] or with extra leading dims
+                # in cu_seqlens / packed-batch mode. Flatten to [N_seqs, HV, V, K].
+                # N_seqs == B_ext (cache_indices.shape[0]) by construction.
                 _, HV_e, V_e, K_e = ssm_states.shape
-                h_flat = h.contiguous().reshape(B_ext, HV_e, V_e, K_e)  # [B_ext, HV, V, K]
+                h_flat = h.contiguous().view(-1, HV_e, V_e, K_e)  # [N_seqs, HV, V, K]
+                N_h = h_flat.shape[0]
+                # cache_indices contains the pool slots for the N_h updated sequences
+                idx = cache_indices[:N_h].to(torch.int64)
                 scatter_extend_state(
                     src=h_flat.float(),
                     dst=ssm_states,
                     dst_scale=fp8_scale,
-                    indices=cache_indices.to(torch.int64),
+                    indices=idx,
                     use_sr=False,
                 )
 
