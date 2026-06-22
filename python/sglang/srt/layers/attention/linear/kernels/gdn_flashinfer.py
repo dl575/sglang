@@ -116,11 +116,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
         self.philox_rounds = envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get()
         if self.use_sr:
+            # Pre-allocate a [2]-int32 Philox seed tensor (lo, hi) on device and a
+            # CUDA generator to advance it. Using a persistent device tensor with
+            # out= avoids new allocations inside the CUDA graph capture scope;
+            # using a CUDA generator ensures the RNG state is on-device so its
+            # advance is recorded in the graph and produces different values on
+            # each replay — required for stochastic rounding to be effective.
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.rand_seed = torch.zeros(2, dtype=torch.int32, device=device)
+            self.philox_gen = torch.Generator(device=device)
             logger.info(
                 "FlashInfer GDN decode: SSM stochastic rounding ENABLED "
-                "(hardware cvt.rs, Philox in CuTe DSL, rounds=%d).",
+                "(hardware cvt.rs, Philox in CuTe DSL, rounds=%d, CUDA-graph capturable).",
                 self.philox_rounds,
             )
+        else:
+            self.rand_seed = None
+            self.philox_gen = None
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -197,6 +209,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # kernel indexes it by the same cache_indices as the state pool.
         ssm_state_scale = kwargs.get("ssm_state_scale")
 
+        # Advance the per-step Philox seed for SR. torch.randint with out= fills
+        # the pre-allocated tensor in-place (no allocation inside the graph) using
+        # the CUDA generator (state advance is captured and replays correctly).
+        if self.use_sr:
+            torch.randint(
+                0, 2**31, (2,), dtype=torch.int32,
+                device=self.rand_seed.device,
+                generator=self.philox_gen,
+                out=self.rand_seed,
+            )
+
         if self.use_state_pool:
             output_fi, _ = self._decode_fn(
                 q=query_fi,
@@ -212,6 +235,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 initial_state_indices=cache_indices,
                 use_sr=self.use_sr,
                 philox_rounds=self.philox_rounds,
+                rand_seed=self.rand_seed,
                 state_scale=ssm_state_scale,
             )
         else:
@@ -231,6 +255,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
                 use_sr=self.use_sr,
+                rand_seed=self.rand_seed,
             )
             ssm_states[cache_indices] = new_state
 
@@ -385,6 +410,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # write in-kernel; for fp8 the snapshot is FP32 and SR happens at the
         # post-accept commit (so use_sr is a no-op on the fp8 snapshot write).
         ssm_state_scale = kwargs.get("ssm_state_scale")
+        # Advance seed for SR (same pattern as decode — CUDA-graph capturable).
+        if self.use_sr:
+            torch.randint(
+                0, 2**31, (2,), dtype=torch.int32,
+                device=self.rand_seed.device,
+                generator=self.philox_gen,
+                out=self.rand_seed,
+            )
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
             k=key_mtp,
@@ -402,6 +435,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm=True,
             use_sr=self.use_sr,
             philox_rounds=self.philox_rounds,
+            rand_seed=self.rand_seed,
             state_scale=ssm_state_scale,
         )
 
