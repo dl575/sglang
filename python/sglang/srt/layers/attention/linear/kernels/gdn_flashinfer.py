@@ -249,6 +249,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        ssm_state_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple:
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
@@ -265,16 +266,31 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
+        is_fp8_state = ssm_states.dtype == torch.float8_e4m3fn
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            # Pre-allocate bf16 output_state so the kernel compiles and writes the
-            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
-            # fp32->bf16 conversion in the scatter step.
-            output_state_fi = torch.empty_like(initial_state_fi)
+            if is_fp8_state:
+                # fp8 cache: dequantize to float32 for the prefill kernel.
+                # chunk_gated_delta_rule requires float32 initial_state; passing
+                # raw fp8 bytes would silently misread every element as float32.
+                # Per design: fp8 quantization is decode-only (cache size); prefill
+                # always runs in bf16/fp32 and commits once at the end.
+                raw = ssm_states[ssm_cache_indices].contiguous()  # fp8
+                scale = ssm_state_scale[ssm_cache_indices] if ssm_state_scale is not None else None
+                if scale is not None:
+                    # dequant: fp8 * per-row scale → float32
+                    initial_state_fi = raw.float() * scale.unsqueeze(-1)
+                else:
+                    initial_state_fi = raw.float()
+            else:
+                initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            # chunk_gated_delta_rule writes output_state as float32
+            output_state_fi = torch.empty(
+                initial_state_fi.shape, dtype=torch.float32, device=q.device
+            )
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,
@@ -282,7 +298,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 g=alpha_fi,
                 beta=beta_fi,
                 scale=None,
-                initial_state=initial_state_fi,
+                initial_state=initial_state_fi.float(),
                 output_final_state=True,
                 cu_seqlens=query_start_loc,  # already int32
                 use_qk_l2norm_in_kernel=False,
@@ -310,12 +326,33 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=False,
             )
 
-        # Write back state to pool
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            output_state_fi.to(ssm_states.dtype),
-        )
+        # Write back state to pool with optional SR — consistent with the per-step
+        # decode commit. Uses scatter_extend_state for all state dtypes:
+        #   fp8:       per-row amax/448 scale + optional cvt.rs e4m3x4 SR
+        #   bf16/fp16: optional cvt.rs narrowx2 SR, else direct RTN cast
+        # SR is applied when self.use_sr is set (SM100+ only, validated at startup).
+        if self.use_state_pool:
+            from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+                scatter_extend_state,
+            )
+            # output_state_fi is float32 [B, HV, V, K] (prefill kernel output)
+            B = ssm_cache_indices.shape[0]
+            _, HV, V, K = ssm_states.shape  # pool, HV, V, K
+            out = output_state_fi.reshape(B, HV, V, K)
+            scatter_extend_state(
+                src=out,
+                dst=ssm_states,
+                dst_scale=ssm_state_scale,
+                indices=ssm_cache_indices,
+                use_sr=self.use_sr,
+                philox_rounds=self.philox_rounds,
+            )
+        else:
+            ssm_states.index_copy_(
+                0,
+                ssm_cache_indices,
+                output_state_fi.to(ssm_states.dtype),
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
