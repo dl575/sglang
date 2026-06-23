@@ -541,10 +541,20 @@ class MambaAttnBackendBase(AttentionBackend):
             # per-row scale must move with it or the destination dequants against
             # a stale scale. (Per-layer cache here: index dim 0 = pool slot.)
             if ssm_state_scale is not None:
+                # Boolean-mask indexing (scale[idx[mask]]) calls nonzero()
+                # internally -> a host sync that is ILLEGAL during CUDA graph
+                # capture (invalidates the stream). Mirror the on-device mask
+                # semantics of the Triton state scatter with integer index_put:
+                # tracked rows copy src->dst; untracked rows self-copy (no-op).
+                # Fully capturable; no data-dependent shapes, no sync.
                 m = forward_batch.mamba_track_mask
-                ssm_state_scale[forward_batch.mamba_track_indices[m]] = (
-                    ssm_state_scale[cache_indices[m]]
+                # cache_indices is int32, mamba_track_indices is int64 -> cast
+                # both to int64 so torch.where agrees on dtype.
+                src_idx = cache_indices.long()
+                dst_idx = torch.where(
+                    m, forward_batch.mamba_track_indices, src_idx
                 )
+                ssm_state_scale[dst_idx] = ssm_state_scale[src_idx]
 
     def _track_mamba_state_extend(
         self,
