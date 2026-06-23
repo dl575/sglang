@@ -116,14 +116,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
         self.philox_rounds = envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get()
         if self.use_sr:
-            # Pre-allocate a [2]-int32 Philox seed tensor on device.
-            # Advance using the DEFAULT CUDA generator (no generator= arg) with
-            # out= to avoid in-graph allocation. PyTorch automatically puts the
-            # default CUDA generator into capture mode during graph recording, so
-            # the RNG op is recorded and advances correctly on each replay —
-            # different seed every decode step, entirely on GPU, no CPU transfer.
-            # (A separately-created torch.Generator(device='cuda') is NOT put
-            # into capture mode and raises "not in capture mode" errors.)
+            # Pre-allocate a [2]-int32 Philox seed counter on device.
+            # rand_seed[0] is incremented by 1 on every decode() / target_verify()
+            # call via an in-place add_ — a standard CUDA op that is fully
+            # capturable in CUDA graphs. Each GDN layer call within a forward pass
+            # gets a unique seed value (counter advances per call), and each decode
+            # step advances the counter further, giving Philox(counter, k_offset)
+            # excellent per-element diversity with no CPU transfer and no global
+            # CUDA RNG state pollution.
             device = torch.device("cuda", torch.cuda.current_device())
             self.rand_seed = torch.zeros(2, dtype=torch.int32, device=device)
             self.philox_gen = None
@@ -211,16 +211,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # kernel indexes it by the same cache_indices as the state pool.
         ssm_state_scale = kwargs.get("ssm_state_scale")
 
-        # Advance the per-step Philox seed using the default CUDA generator.
-        # out= fills the pre-allocated tensor in-place (no graph-time allocation).
-        # The default CUDA generator is in capture mode during graph recording
-        # and advances correctly on each replay — GPU-only, no CPU transfer.
+        # Increment the Philox seed counter. Each GDN layer call gets a unique
+        # seed; each decode step advances further. add_ is a standard in-place
+        # CUDA op — fully capturable, GPU-only, no allocation, no RNG pollution.
         if self.use_sr:
-            torch.randint(
-                0, 2**31, (2,), dtype=torch.int32,
-                device=self.rand_seed.device,
-                out=self.rand_seed,
-            )
+            self.rand_seed[0].add_(1)
 
         if self.use_state_pool:
             output_fi, _ = self._decode_fn(
