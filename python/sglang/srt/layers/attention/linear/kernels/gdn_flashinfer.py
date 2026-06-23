@@ -117,15 +117,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self.philox_rounds = envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get()
         if self.use_sr:
             # Pre-allocate a [2]-int32 Philox seed tensor on device.
-            # The seed is advanced from the CPU RNG (torch.randint with no device
-            # arg, i.e. CPU-side) and copied non-blocking into the device tensor
-            # before each kernel call. The device tensor is a static graph input:
-            # the graph sees "read from this address" on every replay, and the CPU
-            # copy updates the value between replays — different seed each step,
-            # no CUDA generator state change inside the captured graph.
+            # Advance using the DEFAULT CUDA generator (no generator= arg) with
+            # out= to avoid in-graph allocation. PyTorch automatically puts the
+            # default CUDA generator into capture mode during graph recording, so
+            # the RNG op is recorded and advances correctly on each replay —
+            # different seed every decode step, entirely on GPU, no CPU transfer.
+            # (A separately-created torch.Generator(device='cuda') is NOT put
+            # into capture mode and raises "not in capture mode" errors.)
             device = torch.device("cuda", torch.cuda.current_device())
             self.rand_seed = torch.zeros(2, dtype=torch.int32, device=device)
-            self.philox_gen = None  # not used; CPU randint advances host RNG
+            self.philox_gen = None
             logger.info(
                 "FlashInfer GDN decode: SSM stochastic rounding ENABLED "
                 "(hardware cvt.rs, Philox in CuTe DSL, rounds=%d, CUDA-graph capturable).",
@@ -210,14 +211,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # kernel indexes it by the same cache_indices as the state pool.
         ssm_state_scale = kwargs.get("ssm_state_scale")
 
-        # Advance the per-step Philox seed for SR. Draw on CPU (always outside
-        # graph capture), copy non-blocking to the pre-allocated device tensor
-        # as a static graph input. The graph sees a fixed device address; the
-        # value changes between replays via the CPU copy, giving a different
-        # seed each decode step without any CUDA generator inside the graph.
+        # Advance the per-step Philox seed using the default CUDA generator.
+        # out= fills the pre-allocated tensor in-place (no graph-time allocation).
+        # The default CUDA generator is in capture mode during graph recording
+        # and advances correctly on each replay — GPU-only, no CPU transfer.
         if self.use_sr:
-            cpu_seed = torch.randint(0, 2**31, (2,), dtype=torch.int32)
-            self.rand_seed.copy_(cpu_seed, non_blocking=True)
+            torch.randint(
+                0, 2**31, (2,), dtype=torch.int32,
+                device=self.rand_seed.device,
+                out=self.rand_seed,
+            )
 
         if self.use_state_pool:
             output_fi, _ = self._decode_fn(
