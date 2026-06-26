@@ -339,7 +339,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_v_dim=layer.head_v_dim,
             )
             self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
+                forward_batch,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                ssm_state_scale=layer_cache.temporal_scale,
             )
             return core_attn_out
 
@@ -371,7 +375,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
+            forward_batch,
+            conv_states,
+            ssm_states,
+            cache_indices,
+            ssm_state_scale=layer_cache.temporal_scale,
         )
 
         return core_attn_out
@@ -490,19 +498,66 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
+                # fp8: scale pool for the verify kernel's load-dequant (None for
+                # bf16/fp16). Mirrors the decode path's ssm_state_scale.
+                ssm_state_scale=mamba_cache_params.temporal_scale,
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+            # fp8 state: the triton extend kernel expects bf16/fp32 state and
+            # writes back bf16 in-place. With an fp8 pool we must give it a
+            # temporary bf16 staging buffer, then quantize the result to fp8
+            # (with per-row scale) before committing to the real fp8 pool.
+            fp8_state = ssm_states.dtype == torch.float8_e4m3fn
+            if fp8_state:
+                # The triton extend kernel expects bf16/fp32 state but the pool
+                # is fp8. Pass a batch-sized bf16 buffer (B slots only, not the
+                # full pool) seeded with the dequantized current state.
+                fp8_scale = mamba_cache_params.temporal_scale  # [pool, HV, V]
+                B_ext = cache_indices.shape[0]
+                _, HV_e, V_e, K_e = ssm_states.shape
+                slots = ssm_states[cache_indices]     # fp8 [B, HV, V, K]
+                scales = fp8_scale[cache_indices]     # fp32 [B, HV, V]
+                # dequant: fp8 * per-row scale → fp32 → bf16
+                bf16_buf = (slots.float() * scales.unsqueeze(-1)).to(
+                    torch.bfloat16
+                )  # [B, HV, V, K]
+                # triton needs initial_state_indices pointing into this buffer
+                buf_indices = torch.arange(
+                    B_ext, dtype=torch.int32, device=ssm_states.device
+                )
+                extend_states = bf16_buf
+                extend_indices = buf_indices
+            else:
+                extend_states = ssm_states
+                extend_indices = cache_indices
+
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                ssm_states=extend_states,
+                cache_indices=extend_indices,
                 query_start_loc=query_start_loc,
+                ssm_state_scale=mamba_cache_params.temporal_scale,
             )
+
+            if fp8_state:
+                # Quantize the triton-computed final state (bf16_buf, updated in-place
+                # by chunk_gated_delta_rule) to fp8 with per-row scale and scatter to
+                # the real fp8 pool. Use _quantize_fp8_per_row (Python/ATen, no Triton)
+                # to avoid the Triton fp8 vectorized-store interleaving bug that produces
+                # wrong bit patterns for every other K-element pair.
+                from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                    _quantize_fp8_per_row,
+                )
+                q_state, q_scale = _quantize_fp8_per_row(bf16_buf)
+                # index_copy_ not supported for fp8; use advanced indexing
+                ssm_states[cache_indices.to(torch.int64)] = q_state
+                fp8_scale[cache_indices.to(torch.int64)] = q_scale
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
@@ -512,7 +567,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             if h is not None:
                 self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
+                    forward_batch,
+                    h,
+                    ssm_states,
+                    forward_metadata,
+                    ssm_state_scale=mamba_cache_params.temporal_scale,
                 )
 
         return core_attn_out

@@ -25,6 +25,22 @@ from sglang.srt.speculative.spec_info import SpecInput
 logger = logging.getLogger(__name__)
 
 
+def _quantize_fp8_per_row(x: torch.Tensor):
+    """Per-(.,K) row fp8 (E4M3) quantization, RTN: ``x[..., K] -> (e4m3, scale[...])``.
+
+    Matches the decode/commit convention (scale = amax / 448, block = K). Used by
+    the prefix-cache *track* paths, where a persistent fp8 SSM slot is (re)written
+    by a torch-level copy and must carry its companion per-row scale. RTN (no SR)
+    here — the track path fires only at prefix-cache boundaries; the per-step
+    decode and the post-accept commit carry the stochastic rounding.
+    """
+    xf = x.float()  # h is bf16/fp16; compute in fp32 so the scale matches the
+    amax = xf.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # fp32 temporal_scale pool
+    scale = amax / 448.0
+    q = (xf / scale).to(torch.float8_e4m3fn)
+    return q, scale.squeeze(-1)
+
+
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -497,6 +513,7 @@ class MambaAttnBackendBase(AttentionBackend):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        ssm_state_scale: Optional[torch.Tensor] = None,
     ):
         """
         Track and copy Mamba conv/SSM states during decode for prefix caching.
@@ -520,6 +537,24 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_indices,
                 forward_batch.batch_size,
             )
+            # fp8: the persistent ssm copy above moves bytes only; the companion
+            # per-row scale must move with it or the destination dequants against
+            # a stale scale. (Per-layer cache here: index dim 0 = pool slot.)
+            if ssm_state_scale is not None:
+                # Boolean-mask indexing (scale[idx[mask]]) calls nonzero()
+                # internally -> a host sync that is ILLEGAL during CUDA graph
+                # capture (invalidates the stream). Mirror the on-device mask
+                # semantics of the Triton state scatter with integer index_put:
+                # tracked rows copy src->dst; untracked rows self-copy (no-op).
+                # Fully capturable; no data-dependent shapes, no sync.
+                m = forward_batch.mamba_track_mask
+                # cache_indices is int32, mamba_track_indices is int64 -> cast
+                # both to int64 so torch.where agrees on dtype.
+                src_idx = cache_indices.long()
+                dst_idx = torch.where(
+                    m, forward_batch.mamba_track_indices, src_idx
+                )
+                ssm_state_scale[dst_idx] = ssm_state_scale[src_idx]
 
     def _track_mamba_state_extend(
         self,
@@ -527,6 +562,7 @@ class MambaAttnBackendBase(AttentionBackend):
         h: torch.Tensor,
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
+        ssm_state_scale: Optional[torch.Tensor] = None,
     ):
         """
         Track and copy SSM states during extend for prefix caching.
@@ -544,13 +580,23 @@ class MambaAttnBackendBase(AttentionBackend):
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+                src_h = h[forward_metadata.track_ssm_h_src]
+                dst = forward_metadata.track_ssm_h_dst
+                if ssm_state_scale is not None:
+                    # fp8: quantize the fp32 recurrent state to E4M3 + per-row
+                    # scale (a plain .to(fp8) would drop the scale -> garbage).
+                    q, sc = _quantize_fp8_per_row(src_h)
+                    ssm_states[dst] = q
+                    ssm_state_scale[dst] = sc
+                else:
+                    ssm_states[dst] = src_h.to(ssm_states.dtype, copy=False)
             if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
+                fsrc = forward_metadata.track_ssm_final_src
+                fdst = forward_metadata.track_ssm_final_dst
+                ssm_states[fdst] = ssm_states[fsrc]
+                # fp8: carry the companion per-row scale with the copied state.
+                if ssm_state_scale is not None:
+                    ssm_state_scale[fdst] = ssm_state_scale[fsrc]
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
@@ -894,6 +940,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
+        # fp8 SSM commit: the FP32 intermediate snapshot is quantized to E4M3 +
+        # per-row scale at the scatter (scale is None for bf16/fp16, which copy
+        # as-is). SR config mirrors the decode/verify path. Applies to both SSM
+        # scatters below (commit + prefix-cache track); the conv scatters are
+        # bf16 and copy unchanged.
+        from sglang.srt.environ import envs
+
+        ssm_state_scale = mamba_caches.temporal_scale
+        ssm_use_sr = envs.SGLANG_MAMBA_SSM_ENABLE_STOCHASTIC_ROUNDING.get()
+        ssm_philox_rounds = envs.SGLANG_MAMBA_SSM_PHILOX_ROUNDS.get()
+
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
         fused_mamba_state_scatter_with_mask(
@@ -901,6 +958,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_state_cache,
             state_indices_tensor,
             last_correct_step_indices,
+            dst_scale=ssm_state_scale,
+            use_sr=ssm_use_sr,
+            philox_rounds=ssm_philox_rounds,
         )
         fused_mamba_state_scatter_with_mask(
             conv_states,
@@ -918,6 +978,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 intermediate_state_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+                dst_scale=ssm_state_scale,
+                use_sr=ssm_use_sr,
+                philox_rounds=ssm_philox_rounds,
             )
             fused_mamba_state_scatter_with_mask(
                 conv_states,
